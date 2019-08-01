@@ -1,6 +1,6 @@
 --------------------------------------------------------------------------------
 
-module Database.LMDB.Resource.Internal (marshalIn, marshalOut, noWriteFlags) where
+module Database.LMDB.Resource.Utility (marshalIn, marshalOut, noWriteFlags) where
 
 --------------------------------------------------------------------------------
 

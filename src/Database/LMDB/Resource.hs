@@ -15,7 +15,7 @@ import Data.ByteString (ByteString)
 import Database.LMDB.Raw (MDB_cursor', MDB_cursor_op (MDB_FIRST, MDB_NEXT), MDB_dbi',
                           MDB_env, MDB_val, mdb_cursor_close', mdb_cursor_get', mdb_cursor_open',
                           mdb_put', mdb_txn_abort, mdb_txn_begin, mdb_txn_commit)
-import Database.LMDB.Resource.Internal (marshalIn, marshalOut, noWriteFlags)
+import Database.LMDB.Resource.Utility (marshalIn, marshalOut, noWriteFlags)
 import Foreign (Ptr, free, malloc, peek)
 
 --------------------------------------------------------------------------------
