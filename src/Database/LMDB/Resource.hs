@@ -12,11 +12,13 @@ import Control.Monad.IO.Class (MonadIO, liftIO)
 import Control.Monad.Trans (MonadTrans, lift)
 import Control.Monad.Trans.Resource (MonadResource, allocate, register, release, unprotect)
 import Data.ByteString (ByteString)
+import qualified Data.ByteString as B (take)
 import Database.LMDB.Raw (MDB_cursor', MDB_cursor_op (MDB_FIRST, MDB_NEXT), MDB_dbi',
                           MDB_env, MDB_val, mdb_cursor_close', mdb_cursor_get', mdb_cursor_open',
                           mdb_put', mdb_txn_abort, mdb_txn_begin, mdb_txn_commit)
-import Database.LMDB.Resource.Utility (marshalIn, marshalOut, noWriteFlags)
+import Database.LMDB.Resource.Utility (emptyWriteFlags, marshalIn, marshalOut, noOverwriteWriteFlag)
 import Foreign (Ptr, free, malloc, peek)
+import UnliftIO.Exception (throwIO, throwString, tryAny)
 
 --------------------------------------------------------------------------------
 
@@ -44,15 +46,23 @@ yieldAll curs kp vp first yield = do
 --------------------------------------------------------------------------------
 
 -- | Creates a write transaction, within which we can write key-value pairs to the database.
-writeLMDB :: (MonadResource m) => MDB_env -> MDB_dbi' -> (((ByteString, ByteString) -> m ()) -> m r) -> m r
-writeLMDB env dbi write = do
+writeLMDB :: (MonadResource m)
+          => MDB_env
+          -> MDB_dbi'
+          -> Bool     -- ^ If 'True', an exception will be thrown when attempting to re-insert a key.
+          -> (((ByteString, ByteString) -> m ()) -> m r)
+          -> m r
+writeLMDB env dbi noOverwrite write = do
     channel <- liftIO createChannel
     _ <- liftIO . asyncBound $ startChannel channel
     finishKey <- register $ endChannel channel
     (txnKey, txn) <- allocate (runOnChannel channel $ mdb_txn_begin env Nothing False)
                               (\txn -> runOnChannel channel $ mdb_txn_abort txn)
-    r <- write $ \(k, v) -> liftIO . runOnChannel channel . marshalOut k $ \k' -> marshalOut v $ \v' ->
-        mdb_put' noWriteFlags txn dbi k' v' >> return ()
+    r <- write $ \(k, v) -> liftIO . runOnChannel channel . marshalOut k $ \k' -> marshalOut v $ \v' -> do
+        res <- mdb_put' (if noOverwrite then noOverwriteWriteFlag else emptyWriteFlags) txn dbi k' v'
+        if not res && noOverwrite
+            then throwString $ "LMDB key already exists: " ++ show (B.take 100 k)
+            else return ()
     _ <- unprotect txnKey
     liftIO . runOnChannel channel $ mdb_txn_commit txn
     release finishKey
@@ -81,8 +91,11 @@ startChannel channel@(Channel { chan = chan', finishMVar = finishMVar' }) = do
 runOnChannel :: Channel -> IO a -> IO a
 runOnChannel (Channel { chan = chan' }) io = do
     mVar <- newEmptyMVar
-    writeChan chan' (io >>= putMVar mVar)
-    takeMVar mVar
+    writeChan chan' $
+        -- Catch synchronous exception and keep the channel running.
+        tryAny io >>= either (putMVar mVar . Left) (putMVar mVar . Right)
+    -- Rethrow synchronous exception.
+    takeMVar mVar >>= either throwIO return
 
 endChannel :: Channel -> IO ()
 endChannel (Channel { chan = chan', finishMVar = finishMVar' }) = do
