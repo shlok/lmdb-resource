@@ -7,7 +7,7 @@ module Database.LMDB.Resource (readLMDB, writeLMDB) where
 import Control.Concurrent.Async (asyncBound)
 import Control.Concurrent.Chan (Chan, newChan, readChan, writeChan)
 import Control.Concurrent.MVar (MVar, isEmptyMVar, newEmptyMVar, putMVar, takeMVar)
-import Control.Monad (when)
+import Control.Monad (join, when)
 import Control.Monad.IO.Class (MonadIO, liftIO)
 import Control.Monad.Trans (MonadTrans, lift)
 import Control.Monad.Trans.Resource (MonadResource, allocate, register, release, unprotect)
@@ -57,12 +57,10 @@ writeLMDB env dbi noOverwrite write = do
     _ <- liftIO . asyncBound $ startChannel channel
     finishKey <- register $ endChannel channel
     (txnKey, txn) <- allocate (runOnChannel channel $ mdb_txn_begin env Nothing False)
-                              (\txn -> runOnChannel channel $ mdb_txn_abort txn)
+                              (runOnChannel channel . mdb_txn_abort)
     r <- write $ \(k, v) -> liftIO . runOnChannel channel . marshalOut k $ \k' -> marshalOut v $ \v' -> do
         res <- mdb_put' (if noOverwrite then noOverwriteWriteFlag else emptyWriteFlags) txn dbi k' v'
-        if not res && noOverwrite
-            then throwString $ "LMDB key already exists: " ++ show (B.take 100 k)
-            else return ()
+        when (not res && noOverwrite) $ throwString $ "LMDB key already exists: " ++ show (B.take 100 k)
     _ <- unprotect txnKey
     liftIO . runOnChannel channel $ mdb_txn_commit txn
     release finishKey
@@ -83,13 +81,12 @@ createChannel = Channel <$> newChan <*> newEmptyMVar
 -- | We will call 'startChannel' with 'asyncBound', which will cause
 -- IO actions that we 'runOnChannel' to run on a bound thread.
 startChannel :: Channel -> IO ()
-startChannel channel@(Channel { chan = chan', finishMVar = finishMVar' }) = do
-    io <- readChan chan'
-    io
-    isEmptyMVar finishMVar' >>= (flip when) (startChannel channel)
+startChannel channel@Channel { chan = chan', finishMVar = finishMVar' } = do
+    join (readChan chan')
+    isEmptyMVar finishMVar' >>= flip when (startChannel channel)
 
 runOnChannel :: Channel -> IO a -> IO a
-runOnChannel (Channel { chan = chan' }) io = do
+runOnChannel Channel { chan = chan' } io = do
     mVar <- newEmptyMVar
     writeChan chan' $
         -- Catch synchronous exception and keep the channel running.
@@ -98,7 +95,7 @@ runOnChannel (Channel { chan = chan' }) io = do
     takeMVar mVar >>= either throwIO return
 
 endChannel :: Channel -> IO ()
-endChannel (Channel { chan = chan', finishMVar = finishMVar' }) = do
+endChannel Channel { chan = chan', finishMVar = finishMVar' } = do
     putMVar finishMVar' ()
     writeChan chan' (return ())
 

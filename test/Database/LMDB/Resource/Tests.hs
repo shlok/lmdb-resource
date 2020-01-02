@@ -9,7 +9,7 @@ module Database.LMDB.Resource.Tests (tests) where
 --------------------------------------------------------------------------------
 
 import Control.Concurrent.Async (asyncBound, wait)
-import Control.Monad (forM_)
+import Control.Monad (forM_, void)
 import Control.Monad.Trans.Resource (runResourceT)
 import Control.Monad.Writer.Strict (execWriterT, tell)
 import Data.ByteString (ByteString, pack)
@@ -36,12 +36,12 @@ testReadLMDB res = testProperty "readLMDB" . monadicIO $ do
     (env, dbi) <- run res
     run $ clearDB env dbi
     keyValuePairs <- arbitraryKeyValuePairs
-    run $ (asyncBound $ do
+    run $ asyncBound (do
         txn <- mdb_txn_begin env Nothing False
         forM_ keyValuePairs $ \(k, v) -> marshalOut k $ \k' ->
-                                         marshalOut v $ \v' -> mdb_put' emptyWriteFlags txn dbi k' v' >> return ()
+                                         marshalOut v $ \v' -> void (mdb_put' emptyWriteFlags txn dbi k' v')
         mdb_txn_commit txn) >>= wait
-    readPairs <- run . runResourceT . execWriterT $ readLMDB env dbi (\kvp -> tell [kvp] >> return ())
+    readPairs <- run . runResourceT . execWriterT $ readLMDB env dbi (\kvp -> void $ tell [kvp])
     return $ readPairs == (sort . removeDuplicateKeys $ keyValuePairs)
 
 -- | Clear the database, write key-value pairs to it using our library with key overwriting allowed, read
@@ -53,7 +53,7 @@ testWriteLMDB res = testProperty "writeLMDB" . monadicIO $ do
     keyValuePairs <- arbitraryKeyValuePairs
     retValue <- pick (arbitrary @String)
     r <- run . runResourceT $ writeLMDB env dbi False (\write -> forM_ keyValuePairs write >> return retValue)
-    readPairs <- run . runResourceT . execWriterT $ readLMDB env dbi (\kvp -> tell [kvp] >> return ())
+    readPairs <- run . runResourceT . execWriterT $ readLMDB env dbi (\kvp -> void $ tell [kvp])
     return $ r == retValue && readPairs == (sort . removeDuplicateKeys $ keyValuePairs)
 
 -- | Clear the database, write key-value pairs to it using our library with key overwriting
@@ -63,13 +63,13 @@ testWriteLMDB2 res = testProperty "writeLMDB2" . monadicIO $ do
     (env, dbi) <- run res
     run $ clearDB env dbi
     keyValuePairs <- arbitraryKeyValuePairs
-    e <- run . tryAny . runResourceT $ writeLMDB env dbi True (\write -> forM_ keyValuePairs write)
+    e <- run . tryAny . runResourceT $ writeLMDB env dbi True (forM_ keyValuePairs)
     case e of
         Left _ -> return $ hasDuplicateKeys keyValuePairs
         Right _ -> return . not $ hasDuplicateKeys keyValuePairs
 
 clearDB :: MDB_env -> MDB_dbi' -> IO ()
-clearDB env dbi = (asyncBound $ do
+clearDB env dbi = asyncBound (do
     txn <- mdb_txn_begin env Nothing False
     mdb_clear' txn dbi
     mdb_txn_commit txn) >>= wait
@@ -77,7 +77,7 @@ clearDB env dbi = (asyncBound $ do
 arbitraryKeyValuePairs :: PropertyM IO [(ByteString, ByteString)]
 arbitraryKeyValuePairs =
     map (\(ws1, ws2) -> (pack ws1, pack ws2))
-    . filter (\(ws1, _) -> length ws1 > 0) -- LMDB does not allow empty keys.
+    . filter (\(ws1, _) -> not (null ws1)) -- LMDB does not allow empty keys.
    <$> pick arbitrary
 
 -- | Note that this function retains the last value for each key.
