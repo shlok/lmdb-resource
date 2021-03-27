@@ -1,31 +1,55 @@
 --------------------------------------------------------------------------------
 
-module Database.LMDB.Resource (readLMDB, writeLMDB) where
+module Database.LMDB.Resource (marshalOut, readLMDB, readAllLMDB, writeLMDB) where
 
 --------------------------------------------------------------------------------
 
-import Control.Concurrent.Async (asyncBound)
-import Control.Concurrent.Chan (Chan, newChan, readChan, writeChan)
-import Control.Concurrent.MVar (MVar, isEmptyMVar, newEmptyMVar, putMVar, takeMVar)
-import Control.Monad (join, when)
+import Control.Concurrent (isCurrentThreadBound)
+import Control.Monad (unless, when)
 import Control.Monad.IO.Class (MonadIO, liftIO)
 import Control.Monad.Trans (MonadTrans, lift)
-import Control.Monad.Trans.Resource (MonadResource, allocate, register, release, unprotect)
-import Data.ByteString (ByteString)
+import Control.Monad.Trans.Resource (MonadResource, allocate, release, unprotect)
+import Data.ByteString (ByteString, packCStringLen)
 import qualified Data.ByteString as B (take)
+import Data.ByteString.Unsafe (unsafeUseAsCStringLen)
 import Database.LMDB.Raw (MDB_cursor', MDB_cursor_op (MDB_FIRST, MDB_NEXT), MDB_dbi',
-                          MDB_env, MDB_val, mdb_cursor_close', mdb_cursor_get', mdb_cursor_open',
-                          mdb_put', mdb_txn_abort, mdb_txn_begin, mdb_txn_commit)
-import Database.LMDB.Resource.Utility (emptyWriteFlags, marshalIn, marshalOut, noOverwriteWriteFlag)
-import Foreign (Ptr, free, malloc, peek)
-import UnliftIO.Exception (throwIO, throwString, tryAny)
+                          MDB_env, MDB_val (MDB_val), MDB_WriteFlags, mdb_cursor_close', mdb_cursor_get',
+                          mdb_cursor_open', mdb_get', mdb_put', mdb_txn_abort, mdb_txn_begin, mdb_txn_commit)
+import Foreign (Ptr, castPtr, free, malloc, peek)
+import UnliftIO.Exception (throwString)
+
+--------------------------------------------------------------------------------
+
+--  Write streaming version.
+-- readLMDB' env dbi s =
+--     readLMDB env dbi $ \mp -> S.mapM (liftIO . mp) s
+
+-- -- Write conduit version.
+-- readLMDB'' env dbi =
+--     readLMDB env dbi $ \mp -> awaitForever $ \k -> do
+--         v <- liftIO $ mp k
+--         C.yield v
+
+-- | Creates a read transaction, within which we can query for keys in the database.
+readLMDB :: (MonadResource m, MonadTrans t, MonadIO (t m))
+         => MDB_env -> MDB_dbi' -> ((ByteString -> IO (Maybe ByteString)) -> t m r) -> t m r
+readLMDB env dbi mp = do
+    (txnKey, txn) <- lift $ allocate (mdb_txn_begin env Nothing True) mdb_txn_abort
+    r <- mp $ \k -> marshalOut k $ \kv -> do
+        mvv <- mdb_get' txn dbi kv
+        case mvv of
+            Nothing -> return Nothing
+            Just vv -> Just <$> marshalIn vv
+    _ <- unprotect txnKey
+    liftIO $ mdb_txn_commit txn
+    return r
 
 --------------------------------------------------------------------------------
 
 -- | Creates a read transaction, within which we can read all key-value pairs from the database.
-readLMDB :: (MonadResource m, MonadTrans t, MonadIO (t m))
-         => MDB_env -> MDB_dbi' -> ((ByteString, ByteString) -> t m ()) -> t m ()
-readLMDB env dbi yield = do
+readAllLMDB :: (MonadResource m, MonadTrans t, MonadIO (t m))
+            => MDB_env -> MDB_dbi' -> ((ByteString, ByteString) -> t m ()) -> t m ()
+readAllLMDB env dbi yield = do
     (txnKey, txn) <- lift $ allocate (mdb_txn_begin env Nothing True) mdb_txn_abort
     (cursKey, curs) <- lift $ allocate (mdb_cursor_open' txn dbi) mdb_cursor_close'
     (ptrKey, (kp, vp)) <- lift $ allocate ((,) <$> malloc <*> malloc) (\(kp, vp) -> free kp >> free vp)
@@ -33,8 +57,8 @@ readLMDB env dbi yield = do
     _ <- release ptrKey >> release cursKey >> unprotect txnKey
     liftIO $ mdb_txn_commit txn
 
-yieldAll :: (Monad m, MonadTrans t, MonadIO (t m)) => MDB_cursor' -> Ptr MDB_val -> Ptr MDB_val
-         -> Bool -> ((ByteString, ByteString) -> t m ()) -> t m ()
+yieldAll :: (MonadIO m)
+         => MDB_cursor' -> Ptr MDB_val -> Ptr MDB_val -> Bool -> ((ByteString, ByteString) -> m ()) -> m ()
 yieldAll curs kp vp first yield = do
     found <- liftIO $ mdb_cursor_get' (if first then MDB_FIRST else MDB_NEXT) curs kp vp
     when found $ do
@@ -46,57 +70,26 @@ yieldAll curs kp vp first yield = do
 --------------------------------------------------------------------------------
 
 -- | Creates a write transaction, within which we can write key-value pairs to the database.
-writeLMDB :: (MonadResource m)
-          => MDB_env
-          -> MDB_dbi'
-          -> Bool     -- ^ If 'True', an exception will be thrown when attempting to re-insert a key.
-          -> (((ByteString, ByteString) -> m ()) -> m r)
-          -> m r
-writeLMDB env dbi noOverwrite write = do
-    channel <- liftIO createChannel
-    _ <- liftIO . asyncBound $ startChannel channel
-    finishKey <- register $ endChannel channel
-    (txnKey, txn) <- allocate (runOnChannel channel $ mdb_txn_begin env Nothing False)
-                              (runOnChannel channel . mdb_txn_abort)
-    r <- write $ \(k, v) -> liftIO . runOnChannel channel . marshalOut k $ \k' -> marshalOut v $ \v' -> do
-        res <- mdb_put' (if noOverwrite then noOverwriteWriteFlag else emptyWriteFlags) txn dbi k' v'
-        when (not res && noOverwrite) $ throwString $ "LMDB key already exists: " ++ show (B.take 100 k)
+-- Important: The final IO action (the one obtained with 'runResourceT') must be run on a bound thread.
+writeLMDB :: (MonadIO n, MonadResource m)
+          => MDB_env -> MDB_dbi' -> MDB_WriteFlags -> (((ByteString, ByteString) -> n ()) -> m r) -> m r
+writeLMDB env dbi wf write = do
+    isBound <- liftIO isCurrentThreadBound
+    unless isBound (throwString "bound thread expected") -- todo: remove? already checked by lmdb library?
+    (txnKey, txn) <- allocate (mdb_txn_begin env Nothing False) mdb_txn_abort
+    r <- write $ \(k, v) -> liftIO . marshalOut k $ \k' -> marshalOut v $ \v' -> do
+        res <- mdb_put' wf txn dbi k' v'
+        unless res $ throwString $ "MDB_KEYEXIST: " ++ show (B.take 50 k)
     _ <- unprotect txnKey
-    liftIO . runOnChannel channel $ mdb_txn_commit txn
-    release finishKey
+    liftIO $ mdb_txn_commit txn
     return r
 
 --------------------------------------------------------------------------------
 
--- LMDB requires write transactions to happen on a bound thread.
--- The following machinery helps us with that.
+marshalIn :: MDB_val -> IO ByteString
+marshalIn (MDB_val len ptr) = packCStringLen (castPtr ptr, fromIntegral len)
 
-data Channel =
-     Channel { chan       :: !(Chan (IO ()))
-             , finishMVar :: !(MVar ()) }
-
-createChannel :: IO Channel
-createChannel = Channel <$> newChan <*> newEmptyMVar
-
--- | We will call 'startChannel' with 'asyncBound', which will cause
--- IO actions that we 'runOnChannel' to run on a bound thread.
-startChannel :: Channel -> IO ()
-startChannel channel@Channel { chan = chan', finishMVar = finishMVar' } = do
-    join (readChan chan')
-    isEmptyMVar finishMVar' >>= flip when (startChannel channel)
-
-runOnChannel :: Channel -> IO a -> IO a
-runOnChannel Channel { chan = chan' } io = do
-    mVar <- newEmptyMVar
-    writeChan chan' $
-        -- Catch synchronous exception and keep the channel running.
-        tryAny io >>= either (putMVar mVar . Left) (putMVar mVar . Right)
-    -- Rethrow synchronous exception.
-    takeMVar mVar >>= either throwIO return
-
-endChannel :: Channel -> IO ()
-endChannel Channel { chan = chan', finishMVar = finishMVar' } = do
-    putMVar finishMVar' ()
-    writeChan chan' (return ())
+marshalOut :: ByteString -> (MDB_val -> IO a) -> IO a
+marshalOut bs f = unsafeUseAsCStringLen bs $ \(ptr, len) -> f $ MDB_val (fromIntegral len) (castPtr ptr)
 
 --------------------------------------------------------------------------------

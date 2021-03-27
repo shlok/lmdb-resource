@@ -1,17 +1,17 @@
 name:                lmdb-resource
-version:             0.1.0.0
+version:             1.0.0.0
 github:              "shlok/lmdb-resource"
 license:             BSD3
 author:              "Shlok Datye"
 maintainer:          "shlok@quant.is"
-copyright:           "2019 Shlok Datye"
+copyright:           "2020 Shlok Datye"
 
 extra-source-files:
 - README.md
 - ChangeLog.md
 
-synopsis:            Work with an LMDB database within a MonadResource.
-category:            Data, Database
+synopsis:            Stream data from or to an LMDB database.
+category:            Database
 
 description:         Please see the README on GitHub at <https://github.com/shlok/lmdb-resource#readme>
 
@@ -19,9 +19,11 @@ dependencies:
 - async
 - base >= 4.7 && < 5
 - bytestring
+- conduit
 - lmdb
 - mtl
 - resourcet
+- streaming
 - unliftio
 
 ghc-options:

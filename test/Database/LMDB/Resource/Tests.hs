@@ -14,9 +14,8 @@ import Control.Monad.Trans.Resource (runResourceT)
 import Control.Monad.Writer.Strict (execWriterT, tell)
 import Data.ByteString (ByteString, pack)
 import Data.List (foldl', nubBy, sort)
-import Database.LMDB.Raw (MDB_dbi', MDB_env, mdb_clear', mdb_put', mdb_txn_begin, mdb_txn_commit)
-import Database.LMDB.Resource (readLMDB, writeLMDB)
-import Database.LMDB.Resource.Utility (emptyWriteFlags, marshalOut)
+import Database.LMDB.Raw (MDB_dbi', MDB_env, compileWriteFlags, mdb_clear', mdb_put', mdb_txn_begin, mdb_txn_commit)
+import Database.LMDB.Resource (marshalOut, readLMDB, writeLMDB)
 import Test.QuickCheck.Monadic (PropertyM, monadicIO, pick, run)
 import Test.Tasty (TestTree)
 import Test.Tasty.QuickCheck (arbitrary, testProperty)
@@ -39,7 +38,7 @@ testReadLMDB res = testProperty "readLMDB" . monadicIO $ do
     run $ asyncBound (do
         txn <- mdb_txn_begin env Nothing False
         forM_ keyValuePairs $ \(k, v) -> marshalOut k $ \k' ->
-                                         marshalOut v $ \v' -> void (mdb_put' emptyWriteFlags txn dbi k' v')
+                                         marshalOut v $ \v' -> void (mdb_put' (compileWriteFlags []) txn dbi k' v')
         mdb_txn_commit txn) >>= wait
     readPairs <- run . runResourceT . execWriterT $ readLMDB env dbi (\kvp -> void $ tell [kvp])
     return $ readPairs == (sort . removeDuplicateKeys $ keyValuePairs)
